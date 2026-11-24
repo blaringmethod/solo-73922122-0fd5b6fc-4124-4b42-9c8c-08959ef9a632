@@ -40,6 +40,10 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    # WAL：慢速下载的长读事务不阻塞补登/删除锚点与换账写入；
+    # 读事务内所见始终是事务开始时的同一个已提交快照。
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
     return conn
@@ -86,6 +90,42 @@ def load_records(conn: sqlite3.Connection) -> dict[int, tuple[int, int]]:
             "SELECT event_no, prefix_min, prefix_amb FROM event ORDER BY event_no"
         )
     }
+
+
+def get_prefixes(
+    conn: sqlite3.Connection, event_nos: list[int]
+) -> dict[int, tuple[int, int]]:
+    """按事件号逐条点查前缀量（只取所需事件，不整表加载）。"""
+    result: dict[int, tuple[int, int]] = {}
+    for ev in event_nos:
+        row = conn.execute(
+            "SELECT prefix_min, prefix_amb FROM event WHERE event_no = ?", (ev,)
+        ).fetchone()
+        if row is not None:
+            result[ev] = (row["prefix_min"], row["prefix_amb"])
+    return result
+
+
+def iter_events_between(
+    conn: sqlite3.Connection, lo: int, hi: int, batch_size: int = 500
+):
+    """按事件号升序分批产出 [lo, hi] 区间内的事件（keyset 分页）。
+
+    每批一次点查范围读取，内存占用只与批大小有关，不随区间事件条数增长；
+    在调用方持有的读事务内执行，所见为同一已提交快照。
+    """
+    last = lo - 1
+    while True:
+        rows = conn.execute(
+            "SELECT event_no, count, prefix_min, prefix_amb FROM event "
+            "WHERE event_no > ? AND event_no <= ? ORDER BY event_no LIMIT ?",
+            (last, hi, int(batch_size)),
+        ).fetchall()
+        if not rows:
+            return
+        for row in rows:
+            yield dict(row)
+        last = rows[-1]["event_no"]
 
 
 def event_exists(conn: sqlite3.Connection, event_no: int) -> bool:

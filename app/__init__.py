@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import os
 import sqlite3
+import time
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 
 from . import db as dbmod
+from . import export as exportmod
 from .csv_loader import CsvError, parse_events_csv
+from .export import ExportError
 from .reconcile import MIN_ANCHORS, verify
 
 
@@ -16,6 +21,11 @@ def create_app(db_path: str | None = None) -> Flask:
     app = Flask(__name__)
     app.config["DB_PATH"] = db_path or os.environ.get(
         "DB_PATH", os.path.join(os.getcwd(), "data", "inspection.db")
+    )
+    # 取数下载：每批处理/输出的事件条数；批次间人为延时（毫秒，演示慢速下载用）
+    app.config["EXPORT_BATCH_SIZE"] = int(os.environ.get("EXPORT_BATCH_SIZE", "500"))
+    app.config["EXPORT_BATCH_DELAY_MS"] = int(
+        os.environ.get("EXPORT_BATCH_DELAY_MS", "0")
     )
 
     def get_db() -> sqlite3.Connection:
@@ -196,5 +206,108 @@ def create_app(db_path: str | None = None) -> Flask:
             )
         finally:
             conn.close()
+
+    # ---------- 录像时段取数：预检（冲突即拒绝下载） ----------
+    @app.post("/api/export/check")
+    def export_check():
+        payload = request.get_json(silent=True) or {}
+        conn = get_db()
+        try:
+            if not dbmod.has_dataset(conn):
+                return fail("请先上传事件 CSV")
+            try:
+                from_id, to_id, win_start, win_end = exportmod.parse_params(payload)
+                anchors = dbmod.list_anchors(conn)
+                segment = exportmod.resolve_segment(anchors, from_id, to_id)
+                seg_records = dbmod.get_prefixes(
+                    conn, [a["event_no"] for a in segment]
+                )
+                pairs = exportmod.check_segment(seg_records, segment)
+                if not all(p["ok"] for p in pairs):
+                    raise ExportError("段内锚点冲突，已拒绝下载", 409, pairs)
+            except ExportError as exc:
+                return fail(str(exc), exc.status, pairs=exc.pairs)
+            query = (
+                f"from_anchor_id={from_id}&to_anchor_id={to_id}"
+                f"&win_start={win_start}&win_end={win_end}"
+            )
+            return ok(
+                segment=segment,
+                pairs=pairs,
+                window={"start": win_start, "end": win_end},
+                download=f"/api/export/events.csv?{query}",
+                message=f"段内 {len(segment)} 条锚点全部对得上，开始下载",
+            )
+        finally:
+            conn.close()
+
+    # ---------- 录像时段取数：CSV 流式下载 ----------
+    @app.get("/api/export/events.csv")
+    def export_events():
+        conn = get_db()
+        try:
+            if not dbmod.has_dataset(conn):
+                raise ExportError("请先上传事件 CSV")
+            from_id, to_id, win_start, win_end = exportmod.parse_params(request.args)
+            # 快照读事务：锚点与事件都取自下载开始时的同一个已提交状态；
+            # WAL 下本事务不阻塞补登/删除锚点与换账。
+            conn.execute("BEGIN")
+            anchors = dbmod.list_anchors(conn)
+            segment = exportmod.resolve_segment(anchors, from_id, to_id)
+            seg_records = dbmod.get_prefixes(conn, [a["event_no"] for a in segment])
+            pairs = exportmod.check_segment(seg_records, segment)
+            if not all(p["ok"] for p in pairs):
+                raise ExportError("段内锚点冲突，已拒绝下载", 409, pairs)
+        except ExportError as exc:
+            conn.rollback()
+            conn.close()
+            return fail(str(exc), exc.status, pairs=exc.pairs)
+
+        lo_ev = segment[0]["event_no"]
+        hi_ev = segment[-1]["event_no"]
+        batch_size = max(1, app.config["EXPORT_BATCH_SIZE"])
+        delay = max(0, app.config["EXPORT_BATCH_DELAY_MS"]) / 1000.0
+        filename = f"events_e{lo_ev}_e{hi_ev}_{win_start}_{win_end}.csv"
+
+        def generate():
+            """分批推算、分批写出：内存只与批大小有关，不随选段事件条数增长。"""
+            try:
+                buf = io.StringIO()
+                writer = csv.writer(buf)
+                writer.writerow(exportmod.CSV_HEADER)
+                yield buf.getvalue()
+                pending = 0
+                rows = exportmod.iter_export_rows(
+                    dbmod.iter_events_between(conn, lo_ev, hi_ev, batch_size),
+                    segment,
+                    seg_records,
+                    win_start,
+                    win_end,
+                )
+                for ev, count, first, last, step, flag in rows:
+                    if pending == 0:
+                        buf.seek(0)
+                        buf.truncate(0)
+                        writer = csv.writer(buf)
+                    writer.writerow(
+                        [ev, count, first, last, step, exportmod.FLAG_LABELS[flag]]
+                    )
+                    pending += 1
+                    if pending >= batch_size:
+                        if delay:
+                            time.sleep(delay)
+                        yield buf.getvalue()
+                        pending = 0
+                if pending:
+                    yield buf.getvalue()
+            finally:
+                conn.rollback()
+                conn.close()
+
+        return Response(
+            generate(),
+            mimetype="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
 
     return app

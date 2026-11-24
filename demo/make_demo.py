@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -46,7 +47,27 @@ def write_csv(path: str, events: list[dict]) -> None:
             writer.writerow([ev["event_no"], ev["count"]])
 
 
-def main(out_dir: str) -> None:
+def build_large(n: int, seed: int = 20261124) -> tuple[list[dict], list[int]]:
+    """生成 n 个事件的演示大账（间隔 1..90000ms 内确定随机，必然可行）。"""
+    rng = random.Random(seed)
+    counts = [START_COUNT]
+    utc = [START_UTC]
+    for _ in range(n - 1):
+        gap = rng.randint(1, 90000)
+        counts.append((counts[-1] + gap) % MOD)
+        utc.append(utc[-1] + gap)
+    events = [{"event_no": i + 1, "count": c} for i, c in enumerate(counts)]
+    return events, utc
+
+
+def write_anchor_csv(path: str, pairs: list[tuple[int, int]]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["事件号", "纸本UTC毫秒"])
+        w.writerows(pairs)
+
+
+def main(out_dir: str, large_events: int = 0) -> None:
     os.makedirs(out_dir, exist_ok=True)
     events, utc = build()
     write_csv(os.path.join(out_dir, "events.csv"), events)
@@ -85,9 +106,27 @@ def main(out_dir: str) -> None:
     print("双错锚点：", bad2)
     print(f"已写入 {out_dir}")
 
+    if large_events >= 4:
+        # 大账：演示取数下载的分批输出与快照隔离
+        big_events, big_utc = build_large(large_events)
+        write_csv(os.path.join(out_dir, "events_large.csv"), big_events)
+        step = large_events // 4
+        big_anchors = [
+            (i + 1, big_utc[i]) for i in range(0, large_events, step)
+        ]
+        if big_anchors[-1][0] != large_events:
+            big_anchors.append((large_events, big_utc[-1]))
+        write_anchor_csv(os.path.join(out_dir, "anchors_large.csv"), big_anchors)
+        print(f"大账：{large_events} 个事件，{len(big_anchors)} 条锚点，"
+              f"时间跨度 {big_utc[-1] - big_utc[0]} ms，已写入 events_large.csv / anchors_large.csv")
+
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(os.path.abspath(__file__))
     )
-    main(target)
+    large = 0
+    if "--events" in sys.argv:
+        pos = sys.argv.index("--events")
+        large = int(sys.argv[pos + 1])
+    main(target, large)

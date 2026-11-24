@@ -155,6 +155,36 @@ def candidate_range(
     }
 
 
+def _ceil_div(a: int, b: int) -> int:
+    """a/b 向上取整（b > 0，a 可为负）。"""
+    return -((-a) // b)
+
+
+def classify_window(
+    first: int,
+    last: int,
+    step: int,
+    win_start: int,
+    win_end: int,
+) -> str | None:
+    """可取时刻等差数列与窗口 [win_start, win_end)（含起点、不含终点）的关系。
+
+    返回 "must"（全部可取时刻都在窗内，事件必在窗内）、
+    "maybe"（仅部分落在窗内，事件仅可能在窗内）、
+    None（没有任何可取时刻落在窗内，不导出）。
+    """
+    if step <= 0 or last < first:
+        return None
+    # 需存在整数 k：0 <= k <= (last-first)/step 且 win_start <= first+k*step < win_end
+    k_low = max(0, _ceil_div(win_start - first, step))
+    k_high = min((last - first) // step, (win_end - 1 - first) // step)
+    if k_low > k_high:
+        return None
+    if first >= win_start and last < win_end:
+        return "must"
+    return "maybe"
+
+
 def verify(
     records: dict[int, tuple[int, int]],
     anchors: list[dict],

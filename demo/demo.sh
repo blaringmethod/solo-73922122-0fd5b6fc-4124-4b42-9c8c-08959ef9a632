@@ -29,3 +29,33 @@ echo; echo "== 双错账：期望“单处更正无法对平” =="
 curl -s -F "file=@$DIR/events.csv" "$BASE/api/dataset" >/dev/null
 post_anchors "$DIR/anchors_bad_double.csv"
 curl -s -X POST "$BASE/api/verify" | python3 -m json.tool
+
+anchor_id_of() {  # 按事件号取锚点 ID
+  curl -s "$BASE/api/state" | python3 -c "
+import json, sys
+for a in json.load(sys.stdin)['anchors']:
+    if a['event_no'] == $1:
+        print(a['id']); break"
+}
+
+echo; echo "== 录像时段取数：正确账，选锚点(事件1, 事件5)，窗口 [T0+500, T0+90000) =="
+curl -s -F "file=@$DIR/events.csv" "$BASE/api/dataset" >/dev/null
+post_anchors "$DIR/anchors_good.csv"
+FROM_ID=$(anchor_id_of 1); TO_ID=$(anchor_id_of 5)
+echo "-- 预检 /api/export/check --"
+curl -s -X POST "$BASE/api/export/check" -H 'Content-Type: application/json' \
+  -d "{\"from_anchor_id\":$FROM_ID,\"to_anchor_id\":$TO_ID,\"win_start\":1700000000500,\"win_end\":1700000090000}" \
+  | python3 -m json.tool
+echo "-- 下载 /api/export/events.csv（事件2/3 必在窗内，事件4 仅可能在窗内）--"
+curl -s "$BASE/api/export/events.csv?from_anchor_id=$FROM_ID&to_anchor_id=$TO_ID&win_start=1700000000500&win_end=1700000090000"
+
+echo; echo "== 录像时段取数：段内锚点冲突，期望 409 拒绝下载 =="
+curl -s -F "file=@$DIR/events.csv" "$BASE/api/dataset" >/dev/null
+post_anchors "$DIR/anchors_bad_single.csv"
+FROM_ID=$(anchor_id_of 1); TO_ID=$(anchor_id_of 5)
+curl -s -o /dev/null -w "check HTTP %{http_code}\n" -X POST "$BASE/api/export/check" \
+  -H 'Content-Type: application/json' \
+  -d "{\"from_anchor_id\":$FROM_ID,\"to_anchor_id\":$TO_ID,\"win_start\":0,\"win_end\":2000000000000}"
+curl -s -X POST "$BASE/api/export/check" -H 'Content-Type: application/json' \
+  -d "{\"from_anchor_id\":$FROM_ID,\"to_anchor_id\":$TO_ID,\"win_start\":0,\"win_end\":2000000000000}" \
+  | python3 -m json.tool

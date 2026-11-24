@@ -74,6 +74,22 @@
     <h2>3. 核查结论</h2>
     <div id="resultBox"><p class="muted">尚未核查。</p></div>
   </section>
+
+  <section class="card">
+    <h2>4. 录像时段取数（CSV 下载）</h2>
+    <p class="muted">按所选两条锚点及其间的全部锚点推算事件可取时刻；窗口含起点、不含终点。
+      只导出至少有一个可取时刻落在窗内的事件；段内锚点冲突时拒绝下载。</p>
+    <div class="row">
+      <label>起点锚点 <select id="expFrom"></select></label>
+      <label>终点锚点 <select id="expTo"></select></label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label>窗口起点（含）<input type="number" id="winStart" min="0" style="width:180px"></label>
+      <label>窗口终点（不含）<input type="number" id="winEnd" min="1" style="width:180px"></label>
+      <button class="primary" id="exportBtn">核对并下载 CSV</button>
+    </div>
+    <div id="exportInfo" style="margin-top:8px"></div>
+  </section>
 </main>
 
 <script>
@@ -109,6 +125,40 @@ function renderAnchors(anchors) {
         renderAnchors(data.anchors);
       } catch (e) { banner("bad", e.message); }
     }));
+  renderAnchorSelects(anchors);
+}
+
+function renderAnchorSelects(anchors) {
+  // 重建起止锚点下拉，尽量保留原选择
+  const keep = { expFrom: $("expFrom").value, expTo: $("expTo").value };
+  ["expFrom", "expTo"].forEach(id => {
+    const sel = $(id);
+    sel.innerHTML = "";
+    anchors.forEach(a => {
+      const opt = document.createElement("option");
+      opt.value = a.id;
+      opt.textContent = `#${a.id} 事件${a.event_no} @ ${a.utc_ms}`;
+      sel.appendChild(opt);
+    });
+    if (keep[id] && anchors.some(a => String(a.id) === keep[id])) sel.value = keep[id];
+  });
+  if (anchors.length >= 2) {
+    if (!keep.expFrom) $("expFrom").value = String(anchors[0].id);
+    if (!keep.expTo) $("expTo").value = String(anchors[anchors.length - 1].id);
+  }
+}
+
+function showExportPairs(pairs) {
+  // 段内冲突明细：哪一对锚点对不上
+  let html = '<table><thead><tr><th class="l">锚点对</th><th>纸本时差(ms)</th>' +
+    '<th>可达首值</th><th>可达末值</th><th>步长</th><th class="l">结论</th></tr></thead><tbody>';
+  pairs.forEach(p => {
+    html += `<tr><td class="l">事件 ${p.left_event} → ${p.right_event}</td>` +
+      `<td>${p.delta}</td><td>${p.low}</td><td>${p.high}</td><td>${p.step}</td>` +
+      `<td class="l">${p.ok ? '<span class="tag ok">对得上</span>' : '<span class="tag bad">对不上</span>'}</td></tr>`;
+  });
+  html += "</tbody></table>";
+  $("exportInfo").innerHTML = html;
 }
 
 function renderResult(result) {
@@ -216,6 +266,38 @@ $("verifyBtn").addEventListener("click", async () => {
     const data = await api("/api/verify", { method: "POST" });
     renderResult(data.result);
     clearBanner();
+  } catch (e) { banner("bad", e.message); }
+});
+
+$("exportBtn").addEventListener("click", async () => {
+  $("exportInfo").innerHTML = "";
+  const payload = {
+    from_anchor_id: parseInt($("expFrom").value, 10),
+    to_anchor_id: parseInt($("expTo").value, 10),
+    win_start: parseInt($("winStart").value, 10),
+    win_end: parseInt($("winEnd").value, 10),
+  };
+  if ([payload.from_anchor_id, payload.to_anchor_id, payload.win_start, payload.win_end]
+      .some(Number.isNaN)) {
+    return banner("bad", "请选择两条锚点并填写窗口起点、终点（UTC 毫秒整数）");
+  }
+  try {
+    const resp = await fetch("/api/export/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || data.ok === false) {
+      if (data.pairs && data.pairs.length) showExportPairs(data.pairs);
+      return banner("bad", data.error || ("HTTP " + resp.status));
+    }
+    banner("ok", data.message);
+    $("exportInfo").innerHTML =
+      `<p class="muted">段内锚点 ${data.segment.length} 条（事件 ` +
+      `${data.segment[0].event_no} → ${data.segment[data.segment.length - 1].event_no}），` +
+      `窗口 [${data.window.start}, ${data.window.end})，文件下载中……</p>`;
+    window.location.href = data.download;  // 浏览器直接落盘，页面不跳转
   } catch (e) { banner("bad", e.message); }
 });
 
